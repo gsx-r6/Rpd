@@ -165,32 +165,57 @@ jobs:
               Write-Host "🔗 Installing Tailscale..." -ForegroundColor Cyan
               
               $releaseUrl = "https://api.github.com/repos/tailscale/tailscale/releases/latest"
+              $maxRetries = 3
+              $retryCount = 0
+              $downloadUrl = $null
+              $releases = $null
               
-              # Add headers for authenticated API requests to avoid rate limiting
-              $headers = @{
-                  'Accept' = 'application/vnd.github.v3+json'
+              while ($retryCount -lt $maxRetries -and -not $downloadUrl) {
+                  try {
+                      # Add headers for authenticated API requests to avoid rate limiting
+                      $headers = @{
+                          'Accept' = 'application/vnd.github.v3+json'
+                      }
+                      if ($env:GITHUB_TOKEN) {
+                          $headers['Authorization'] = "token $($env:GITHUB_TOKEN)"
+                      }
+                      
+                      $releases = Invoke-RestMethod -Uri $releaseUrl -Headers $headers -ErrorAction Stop
+                      
+                      # Validate response
+                      if (-not $releases -or -not $releases.assets) {
+                          throw "No assets found in release response"
+                      }
+                      
+                      # Log the response for debugging
+                      Write-Host "Found $($releases.assets.count) assets in latest release" -ForegroundColor Gray
+                      
+                      $downloadUrl = $releases.assets | Where-Object { $_.name -like "*windows*amd64*.msi" } | Select-Object -First 1 -ExpandProperty browser_download_url
+                      
+                      if (-not $downloadUrl) {
+                          # Fallback: try to find any MSI file
+                          Write-Host "⚠️  Trying fallback pattern for MSI..." -ForegroundColor Yellow
+                          $downloadUrl = $releases.assets | Where-Object { $_.name -like "*.msi" } | Select-Object -First 1 -ExpandProperty browser_download_url
+                      }
+                      
+                      if (-not $downloadUrl) {
+                          Write-Host "Available assets:" -ForegroundColor Gray
+                          $releases.assets | ForEach-Object { Write-Host "  - $($_.name)" -ForegroundColor Gray }
+                          throw "No MSI file found in assets"
+                      }
+                  } catch {
+                      $retryCount++
+                      if ($retryCount -lt $maxRetries) {
+                          Write-Host "⚠️  Attempt $retryCount/$maxRetries failed: $_. Retrying in 10 seconds..." -ForegroundColor Yellow
+                          Start-Sleep -Seconds 10
+                      } else {
+                          throw $_
+                      }
+                  }
               }
-              if ($env:GITHUB_TOKEN) {
-                  $headers['Authorization'] = "token $($env:GITHUB_TOKEN)"
-              }
-              
-              $releases = Invoke-RestMethod -Uri $releaseUrl -Headers $headers
-              
-              # Log the response for debugging
-              Write-Host "Found $($releases.assets.count) assets in latest release" -ForegroundColor Gray
-              
-              $downloadUrl = $releases.assets | Where-Object { $_.name -like "*windows*amd64*.msi" } | Select-Object -First 1 -ExpandProperty browser_download_url
               
               if (-not $downloadUrl) {
-                  # Fallback: try to find any MSI file
-                  Write-Host "⚠️  Trying fallback pattern for MSI..." -ForegroundColor Yellow
-                  $downloadUrl = $releases.assets | Where-Object { $_.name -like "*.msi" } | Select-Object -First 1 -ExpandProperty browser_download_url
-              }
-              
-              if (-not $downloadUrl) {
-                  Write-Host "Available assets:" -ForegroundColor Gray
-                  $releases.assets | ForEach-Object { Write-Host "  - $($_.name)" -ForegroundColor Gray }
-                  Write-Error "Could not find latest Tailscale MSI"
+                  Write-Error "Could not find latest Tailscale MSI after $maxRetries attempts"
                   exit 1
               }
               
@@ -280,9 +305,9 @@ jobs:
           $userName = "RDP"
 
           Write-Host ""
-          Write-Host "╔════════════════════════════════════════════════════════════╗"
+          Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Green
           Write-Host "║         🚀 RDP & SSH CONNECTION DETAILS 🚀             ║" -ForegroundColor Green
-          Write-Host "╠════════════════════════════════════════════════════════════╣"
+          Write-Host "╠════════════════════════════════════════════════════════════╣" -ForegroundColor Green
           Write-Host "║ 📍 SERVER ADDRESS                                      ║" -ForegroundColor Green
           Write-Host "║    $tsIP" -ForegroundColor Yellow
           Write-Host "║                                                        ║" -ForegroundColor Green
@@ -300,7 +325,7 @@ jobs:
           Write-Host "║ ⏱️  SESSION DURATION: $sessionDuration minutes (5h)      ║" -ForegroundColor Green
           Write-Host "║ ⏱️  Max GitHub Actions limit: 360 minutes (6h)          ║" -ForegroundColor Green
           Write-Host "║ ✅ Margin de sécurité: 60 minutes                      ║" -ForegroundColor Green
-          Write-Host "╚════════════════════════════════════════════════════════════╝"
+          Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Green
           Write-Host ""
 
       - name: Health Check & Monitoring
