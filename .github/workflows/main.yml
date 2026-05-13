@@ -13,10 +13,6 @@ on:
           - '3.10'
           - '3.11'
           - '3.12'
-      additional_packages:
-        description: 'Additional pip packages (comma-separated, optional)'
-        required: false
-        default: ''
 
 jobs:
   secure-rdp:
@@ -61,10 +57,6 @@ jobs:
               netsh advfirewall firewall delete rule name="SSH-Server" 2>$null
               netsh advfirewall firewall add rule name="SSH-Server" `
                 dir=in action=allow protocol=TCP localport=22 >$null 2>&1
-              
-              netsh advfirewall firewall delete rule name="VSCode-Server" 2>$null
-              netsh advfirewall firewall add rule name="VSCode-Server" `
-                dir=in action=allow protocol=TCP localport=8000 >$null 2>&1
               
               Restart-Service -Name TermService -Force
               Start-Sleep -Seconds 5
@@ -145,107 +137,6 @@ jobs:
               exit 1
           }
 
-      - name: Install Python Packages
-        shell: pwsh
-        run: |
-          try {
-              Write-Host "📦 Installing Python packages..." -ForegroundColor Cyan
-              
-              $packages = @(
-                  "pip", "setuptools", "wheel", "virtualenv", "poetry",
-                  "requests", "numpy", "pandas", "matplotlib", "seaborn", "plotly",
-                  "jupyter", "jupyterlab", "ipython", "notebook",
-                  "flask", "django", "fastapi", "uvicorn",
-                  "sqlalchemy", "psycopg2-binary", "pymongo",
-                  "beautifulsoup4", "selenium", "scrapy",
-                  "opencv-python", "pillow",
-                  "scikit-learn", "tensorflow", "torch",
-                  "black", "flake8", "pylint", "mypy",
-                  "pytest", "pytest-cov",
-                  "python-dotenv", "pyyaml", "toml",
-                  "click", "typer", "rich"
-              )
-              
-              $additionalPackages = "${{ github.event.inputs.additional_packages }}"
-              if ($additionalPackages) {
-                  $additional = $additionalPackages -split "," | ForEach-Object { $_.Trim() }
-                  $packages += $additional
-              }
-
-              pip install --upgrade pip setuptools wheel
-              pip install $packages
-              
-              Write-Host "✅ All Python packages installed" -ForegroundColor Green
-          } catch {
-              Write-Error "❌ Package installation failed: $_"
-              exit 1
-          }
-
-      - name: Install Docker
-        shell: pwsh
-        run: |
-          try {
-              Write-Host "🐳 Installing Docker..." -ForegroundColor Cyan
-              
-              $dockerUrl = "https://desktop.docker.com/win/stable/Docker%20Desktop%20Installer.exe"
-              $installerPath = "$env:TEMP\docker-installer.exe"
-
-              Invoke-WebRequest -Uri $dockerUrl -OutFile $installerPath -ErrorAction Stop
-              Start-Process $installerPath -ArgumentList "install --quiet --accept-license" -Wait -NoNewWindow
-              Remove-Item $installerPath -Force
-
-              Start-Sleep -Seconds 10
-              Write-Host "✅ Docker installed successfully" -ForegroundColor Green
-          } catch {
-              Write-Warning "⚠️  Docker installation skipped or failed (may require restart)"
-          }
-
-      - name: Install Node.js & npm
-        shell: pwsh
-        run: |
-          try {
-              Write-Host "📦 Installing Node.js & npm..." -ForegroundColor Cyan
-              
-              $nodeUrl = "https://nodejs.org/dist/v20.11.0/node-v20.11.0-x64.msi"
-              $installerPath = "$env:TEMP\nodejs-installer.msi"
-
-              Invoke-WebRequest -Uri $nodeUrl -OutFile $installerPath -ErrorAction Stop
-              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet" -Wait -NoNewWindow
-              Remove-Item $installerPath -Force
-
-              node --version
-              npm --version
-              Write-Host "✅ Node.js & npm installed successfully" -ForegroundColor Green
-          } catch {
-              Write-Error "❌ Node.js installation failed: $_"
-              exit 1
-          }
-
-      - name: Install Additional Tools
-        shell: pwsh
-        run: |
-          try {
-              Write-Host "🛠️  Installing additional tools..." -ForegroundColor Cyan
-              
-              # 7-Zip
-              $7zipUrl = "https://www.7-zip.org/a/7z2301-x64.exe"
-              $7zipInstaller = "$env:TEMP\7zip-installer.exe"
-              Invoke-WebRequest -Uri $7zipUrl -OutFile $7zipInstaller -ErrorAction Stop
-              Start-Process $7zipInstaller -ArgumentList "/S" -Wait -NoNewWindow
-              Remove-Item $7zipInstaller -Force
-
-              # Git
-              $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.43.0.windows.1/Git-2.43.0-64-bit.exe"
-              $gitInstaller = "$env:TEMP\git-installer.exe"
-              Invoke-WebRequest -Uri $gitUrl -OutFile $gitInstaller -ErrorAction Stop
-              Start-Process $gitInstaller -ArgumentList "/SILENT /NORESTART" -Wait -NoNewWindow
-              Remove-Item $gitInstaller -Force
-
-              Write-Host "✅ Additional tools installed" -ForegroundColor Green
-          } catch {
-              Write-Warning "⚠️  Some tools installation skipped"
-          }
-
       - name: Install and Configure OpenSSH
         shell: pwsh
         run: |
@@ -265,29 +156,6 @@ jobs:
               Write-Host "✅ OpenSSH configured successfully" -ForegroundColor Green
           } catch {
               Write-Warning "⚠️  OpenSSH setup skipped: $_"
-          }
-
-      - name: Install VS Code Server
-        shell: pwsh
-        run: |
-          try {
-              Write-Host "💻 Installing VS Code Server..." -ForegroundColor Cyan
-              
-              $releaseUrl = "https://api.github.com/repos/coder/code-server/releases/latest"
-              $releases = Invoke-RestMethod -Uri $releaseUrl
-              $downloadUrl = $releases.assets | Where-Object { $_.name -like "*windows*x86_64*setup*" } | Select-Object -First 1 -ExpandProperty browser_download_url
-              
-              if ($downloadUrl) {
-                  $installerPath = "$env:TEMP\code-server-installer.exe"
-                  Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -ErrorAction Stop
-                  Start-Process $installerPath -ArgumentList "/S" -Wait -NoNewWindow
-                  Remove-Item $installerPath -Force
-                  Write-Host "✅ VS Code Server installed" -ForegroundColor Green
-              } else {
-                  Write-Warning "⚠️  Could not find VS Code Server installer"
-              }
-          } catch {
-              Write-Warning "⚠️  VS Code Server installation failed: $_"
           }
 
       - name: Install Tailscale
@@ -380,32 +248,6 @@ jobs:
               exit 1
           }
 
-      - name: Environment Info
-        shell: pwsh
-        run: |
-          Write-Host ""
-          Write-Host "📋 Environment Information:" -ForegroundColor Cyan
-          Write-Host "================================" -ForegroundColor Cyan
-          
-          Write-Host "Python:" -ForegroundColor Yellow
-          python --version
-          Write-Host ""
-          
-          Write-Host "Node.js & npm:" -ForegroundColor Yellow
-          node --version
-          npm --version
-          Write-Host ""
-          
-          Write-Host "Git:" -ForegroundColor Yellow
-          git --version
-          Write-Host ""
-          
-          Write-Host "Pip packages:" -ForegroundColor Yellow
-          pip list --format=quiet | Select-Object -First 20
-          
-          Write-Host ""
-          Write-Host "✅ All tools verified" -ForegroundColor Green
-
       - name: Display Connection Details
         id: display-creds
         shell: pwsh
@@ -431,12 +273,7 @@ jobs:
           Write-Host "║                                                        ║" -ForegroundColor Green
           Write-Host "║ ssh -o StrictHostKeyChecking=no RDP@$tsIP" -ForegroundColor Cyan
           Write-Host "║                                                        ║" -ForegroundColor Green
-          Write-Host "║ 💻 VS CODE SERVER                                      ║" -ForegroundColor Green
-          Write-Host "║    http://$tsIP`:8000" -ForegroundColor Yellow
-          Write-Host "║                                                        ║" -ForegroundColor Green
           Write-Host "║ 🐍 Python Version: 3.12                                ║" -ForegroundColor Green
-          Write-Host "║ 🐳 Docker: Installed                                   ║" -ForegroundColor Green
-          Write-Host "║ 📦 Node.js: Installed                                  ║" -ForegroundColor Green
           Write-Host "║                                                        ║" -ForegroundColor Green
           Write-Host "║ ⏱️  SESSION DURATION: $sessionDuration minutes (5h)      ║" -ForegroundColor Green
           Write-Host "║ ⏱️  Max GitHub Actions limit: 360 minutes (6h)          ║" -ForegroundColor Green
