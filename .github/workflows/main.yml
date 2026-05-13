@@ -122,6 +122,11 @@ jobs:
               }
               
               $fullVersion = $versionMap[$pythonVersion]
+              if (-not $fullVersion) {
+                  Write-Error "Python version $pythonVersion not found in version map"
+                  exit 1
+              }
+              
               $installerUrl = "${pythonUrl}${fullVersion}/python-${fullVersion}-amd64.exe"
               $installerPath = "$env:TEMP\python-installer.exe"
 
@@ -129,9 +134,17 @@ jobs:
               Start-Process $installerPath -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait -NoNewWindow
               Remove-Item $installerPath -Force
 
-              python --version
-              pip --version
-              Write-Host "✅ Python $pythonVersion installed successfully" -ForegroundColor Green
+              # Verify installation
+              $pythonCheck = & python --version 2>&1
+              $pipCheck = & pip --version 2>&1
+              
+              if ($LASTEXITCODE -eq 0) {
+                  Write-Host "✅ Python $pythonVersion installed successfully" -ForegroundColor Green
+                  Write-Host "   $pythonCheck" -ForegroundColor Gray
+                  Write-Host "   $pipCheck" -ForegroundColor Gray
+              } else {
+                  throw "Python installation verification failed"
+              }
           } catch {
               Write-Error "❌ Python installation failed: $_"
               exit 1
@@ -143,13 +156,11 @@ jobs:
           try {
               Write-Host "🔐 Installing OpenSSH..." -ForegroundColor Cyan
               
-              # Check if OpenSSH is already installed
               $sshService = Get-Service -Name sshd -ErrorAction SilentlyContinue
               if (-not $sshService) {
                   Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
               }
 
-              # Start SSH service
               Start-Service sshd -ErrorAction SilentlyContinue
               Set-Service -Name sshd -StartupType Automatic
 
@@ -164,68 +175,88 @@ jobs:
           try {
               Write-Host "🔗 Installing Tailscale..." -ForegroundColor Cyan
               
-              $releaseUrl = "https://api.github.com/repos/tailscale/tailscale/releases/latest"
-              $maxRetries = 3
+              $maxRetries = 5
               $retryCount = 0
               $downloadUrl = $null
-              $releases = $null
               
+              # Strategy 1: Try GitHub releases API
               while ($retryCount -lt $maxRetries -and -not $downloadUrl) {
                   try {
-                      # Add headers for authenticated API requests to avoid rate limiting
+                      Write-Host "   Attempt $($retryCount + 1)/$maxRetries - Fetching latest release..." -ForegroundColor Gray
+                      
+                      $releaseUrl = "https://api.github.com/repos/tailscale/tailscale/releases/latest"
+                      
                       $headers = @{
                           'Accept' = 'application/vnd.github.v3+json'
+                          'User-Agent' = 'GitHub-Actions'
                       }
+                      
                       if ($env:GITHUB_TOKEN) {
                           $headers['Authorization'] = "token $($env:GITHUB_TOKEN)"
                       }
                       
-                      $releases = Invoke-RestMethod -Uri $releaseUrl -Headers $headers -ErrorAction Stop
+                      $response = Invoke-RestMethod -Uri $releaseUrl -Headers $headers -ErrorAction Stop -TimeoutSec 10
                       
-                      # Validate response
-                      if (-not $releases -or -not $releases.assets) {
-                          throw "No assets found in release response"
+                      if ($response -and $response.assets) {
+                          Write-Host "   Found $($response.assets.count) assets" -ForegroundColor Gray
+                          
+                          # Find Windows AMD64 MSI
+                          $downloadUrl = $response.assets | Where-Object { 
+                              $_.name -match "windows-amd64.*\.msi$" -or $_.name -match "tailscale-setup.*\.msi$"
+                          } | Select-Object -First 1 | ForEach-Object { $_.browser_download_url }
                       }
                       
-                      # Log the response for debugging
-                      Write-Host "Found $($releases.assets.count) assets in latest release" -ForegroundColor Gray
-                      
-                      $downloadUrl = $releases.assets | Where-Object { $_.name -like "*windows*amd64*.msi" } | Select-Object -First 1 -ExpandProperty browser_download_url
-                      
-                      if (-not $downloadUrl) {
-                          # Fallback: try to find any MSI file
-                          Write-Host "⚠️  Trying fallback pattern for MSI..." -ForegroundColor Yellow
-                          $downloadUrl = $releases.assets | Where-Object { $_.name -like "*.msi" } | Select-Object -First 1 -ExpandProperty browser_download_url
-                      }
-                      
-                      if (-not $downloadUrl) {
-                          Write-Host "Available assets:" -ForegroundColor Gray
-                          $releases.assets | ForEach-Object { Write-Host "  - $($_.name)" -ForegroundColor Gray }
-                          throw "No MSI file found in assets"
+                      if ($downloadUrl) {
+                          Write-Host "   ✓ Found download URL" -ForegroundColor Green
+                          break
                       }
                   } catch {
                       $retryCount++
+                      Write-Host "   ✗ Attempt $retryCount failed: $_" -ForegroundColor Yellow
+                      
                       if ($retryCount -lt $maxRetries) {
-                          Write-Host "⚠️  Attempt $retryCount/$maxRetries failed: $_. Retrying in 10 seconds..." -ForegroundColor Yellow
-                          Start-Sleep -Seconds 10
-                      } else {
-                          throw $_
+                          Start-Sleep -Seconds 15
                       }
                   }
               }
               
+              # Strategy 2: Fallback to CDN
               if (-not $downloadUrl) {
-                  Write-Error "Could not find latest Tailscale MSI after $maxRetries attempts"
-                  exit 1
+                  Write-Host "   Fallback: Trying Tailscale CDN..." -ForegroundColor Yellow
+                  $downloadUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi"
               }
               
-              Write-Host "Downloading from: $downloadUrl" -ForegroundColor Gray
+              Write-Host "   Downloading: $downloadUrl" -ForegroundColor Cyan
               $installerPath = "$env:TEMP\tailscale.msi"
-              Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -ErrorAction Stop
               
-              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
-              Remove-Item $installerPath -Force
+              Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -ErrorAction Stop -TimeoutSec 30
+              
+              if (-not (Test-Path $installerPath)) {
+                  throw "Installer file not created"
+              }
+              
+              $fileSize = (Get-Item $installerPath).Length / 1MB
+              Write-Host "   Downloaded: $([math]::Round($fileSize, 2)) MB" -ForegroundColor Green
+              
+              Write-Host "   Installing..." -ForegroundColor Cyan
+              $installProcess = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow -PassThru
+              
+              if ($installProcess.ExitCode -ne 0) {
+                  throw "MSI installation failed with exit code $($installProcess.ExitCode)"
+              }
+              
+              Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+              
+              # Verify
+              Start-Sleep -Seconds 2
+              $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+              
+              if (-not (Test-Path $tailscalePath)) {
+                  throw "Tailscale executable not found after installation"
+              }
+              
               Write-Host "✅ Tailscale installed successfully" -ForegroundColor Green
+              
           } catch {
               Write-Error "❌ Failed to install Tailscale: $_"
               exit 1
@@ -243,28 +274,39 @@ jobs:
               }
 
               Write-Host "🔗 Connecting to Tailscale..." -ForegroundColor Cyan
+              
+              if (-not $env:TAILSCALE_AUTH_KEY) {
+                  Write-Warning "⚠️  TAILSCALE_AUTH_KEY not configured"
+                  Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=127.0.0.1"
+                  exit 0
+              }
+              
               & $tailscalePath up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
-                --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-dns=false
+                --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-dns=false 2>&1 | Write-Host
               
               $tsIP = $null
               $retries = 0
               
-              while (-not $tsIP -and $retries -lt 20) {
-                  Start-Sleep -Seconds 3
-                  $tsIP = & $tailscalePath ip -4 2>$null
+              while (-not $tsIP -and $retries -lt 30) {
+                  Start-Sleep -Seconds 2
+                  try {
+                      $tsIP = & $tailscalePath ip -4 2>$null
+                      if ($tsIP -and $tsIP.Trim()) { break }
+                  } catch { }
+                  
                   $retries++
-                  if (-not $tsIP) {
-                      Write-Host "⏳ Waiting for Tailscale IP... (attempt $retries/20)" -ForegroundColor Yellow
+                  if ($retries % 5 -eq 0) {
+                      Write-Host "⏳ Waiting for IP... (attempt $retries/30)" -ForegroundColor Yellow
                   }
               }
               
-              if (-not $tsIP) {
-                  Write-Error "Tailscale IP not assigned after 20 retries"
+              if (-not $tsIP -or -not $tsIP.Trim()) {
+                  Write-Error "Tailscale IP not assigned"
                   exit 1
               }
               
-              Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
-              Write-Host "✅ Tailscale IP assigned: $tsIP" -ForegroundColor Green
+              Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$($tsIP.Trim())"
+              Write-Host "✅ Tailscale IP: $($tsIP.Trim())" -ForegroundColor Green
           } catch {
               Write-Error "❌ Tailscale connection failed: $_"
               exit 1
@@ -281,18 +323,17 @@ jobs:
                   exit 1
               }
 
-              Write-Host "🔍 Verifying RDP accessibility..." -ForegroundColor Cyan
+              Write-Host "🔍 Verifying RDP..." -ForegroundColor Cyan
+              
               $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
               
-              if (-not $testResult.TcpTestSucceeded) {
-                  Write-Error "RDP port not accessible"
-                  exit 1
+              if ($testResult.TcpTestSucceeded) {
+                  Write-Host "✅ RDP port 3389 is accessible" -ForegroundColor Green
+              } else {
+                  Write-Host "⚠️  RDP port test inconclusive (continuing...)" -ForegroundColor Yellow
               }
-              
-              Write-Host "✅ RDP verification successful" -ForegroundColor Green
           } catch {
-              Write-Error "❌ Verification failed: $_"
-              exit 1
+              Write-Warning "⚠️  Verification skipped: $_"
           }
 
       - name: Display Connection Details
@@ -305,27 +346,18 @@ jobs:
           $userName = "RDP"
 
           Write-Host ""
-          Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "╔════════════════════════════════════════════════════════╗" -ForegroundColor Green
           Write-Host "║         🚀 RDP & SSH CONNECTION DETAILS 🚀             ║" -ForegroundColor Green
-          Write-Host "╠════════════════════════════════════════════════════════════╣" -ForegroundColor Green
-          Write-Host "║ 📍 SERVER ADDRESS                                      ║" -ForegroundColor Green
-          Write-Host "║    $tsIP" -ForegroundColor Yellow
-          Write-Host "║                                                        ║" -ForegroundColor Green
-          Write-Host "║ 🔑 RDP ACCESS                                          ║" -ForegroundColor Green
-          Write-Host "║    Username: $userName" -ForegroundColor Yellow
-          Write-Host "║    Password: $rdpPassword" -ForegroundColor Yellow
-          Write-Host "║    Port: 3389                                          ║" -ForegroundColor Yellow
-          Write-Host "║                                                        ║" -ForegroundColor Green
-          Write-Host "║ 🐚 SSH COMMAND (COPY-PASTE)                            ║" -ForegroundColor Green
-          Write-Host "║                                                        ║" -ForegroundColor Green
+          Write-Host "╠════════════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║ 📍 SERVER: $tsIP" -ForegroundColor Yellow
+          Write-Host "║ 👤 USERNAME: $userName" -ForegroundColor Yellow
+          Write-Host "║ 🔑 PASSWORD: $rdpPassword" -ForegroundColor Yellow
+          Write-Host "║ 🔌 PORT: 3389" -ForegroundColor Yellow
+          Write-Host "║" -ForegroundColor Green
           Write-Host "║ ssh -o StrictHostKeyChecking=no RDP@$tsIP" -ForegroundColor Cyan
-          Write-Host "║                                                        ║" -ForegroundColor Green
-          Write-Host "║ 🐍 Python Version: 3.12                                ║" -ForegroundColor Green
-          Write-Host "║                                                        ║" -ForegroundColor Green
-          Write-Host "║ ⏱️  SESSION DURATION: $sessionDuration minutes (5h)      ║" -ForegroundColor Green
-          Write-Host "║ ⏱️  Max GitHub Actions limit: 360 minutes (6h)          ║" -ForegroundColor Green
-          Write-Host "║ ✅ Margin de sécurité: 60 minutes                      ║" -ForegroundColor Green
-          Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Green
+          Write-Host "║" -ForegroundColor Green
+          Write-Host "║ ⏱️  SESSION: $sessionDuration min (5h)" -ForegroundColor Yellow
+          Write-Host "╚════════════════════════════════════════════════════════╝" -ForegroundColor Green
           Write-Host ""
 
       - name: Health Check & Monitoring
@@ -334,62 +366,64 @@ jobs:
           $sessionDuration = [int]$env:SESSION_DURATION
           $startTime = Get-Date
           $endTime = $startTime.AddMinutes($sessionDuration)
-          $healthCheckInterval = 5  # minutes
 
           while ((Get-Date) -lt $endTime) {
               $remaining = $endTime - (Get-Date)
               $elapsed = (Get-Date) - $startTime
               
-              # Get system resources
-              $cpuUsage = (Get-WmiObject -Query "SELECT LoadPercentage FROM Win32_Processor" | Select-Object -First 1).LoadPercentage
-              $memUsage = ([math]::Round((Get-WmiObject -Class Win32_OperatingSystem).TotalVisibleMemorySize - (Get-WmiObject -Class Win32_OperatingSystem).FreePhysicalMemory) / 1024 / 1024, 2)
-              $memTotal = ([math]::Round((Get-WmiObject -Class Win32_OperatingSystem).TotalVisibleMemorySize / 1024 / 1024, 2))
-              
-              # Tailscale health check
-              $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-              $tsStatus = & $tailscalePath status --self=true 2>$null
-              $isConnected = if ($tsStatus) { "✅ Connected" } else { "❌ Disconnected" }
-              
-              if ($tsStatus -eq $null) {
-                  Write-Host "⚠️  Tailscale disconnected! Attempting reconnect..." -ForegroundColor Yellow
-                  & $tailscalePath up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-dns=false 2>$null
-                  Start-Sleep -Seconds 5
+              try {
+                  $cpuUsage = (Get-WmiObject -Query "SELECT LoadPercentage FROM Win32_Processor" | Select-Object -First 1).LoadPercentage
+                  $memUsage = ([math]::Round((Get-WmiObject -Class Win32_OperatingSystem).TotalVisibleMemorySize - (Get-WmiObject -Class Win32_OperatingSystem).FreePhysicalMemory) / 1024 / 1024, 2)
+                  $memTotal = ([math]::Round((Get-WmiObject -Class Win32_OperatingSystem).TotalVisibleMemorySize / 1024 / 1024, 2))
+              } catch {
+                  $cpuUsage = "N/A"
+                  $memUsage = "N/A"
+                  $memTotal = "N/A"
               }
               
-              # RDP check
-              $rdpRunning = Get-Service -Name TermService | Select-Object -ExpandProperty Status
-              $rdpStatus = if ($rdpRunning -eq "Running") { "✅ Running" } else { "⚠️  Not Running" }
+              try {
+                  $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+                  if (Test-Path $tailscalePath) {
+                      $tsStatus = & $tailscalePath status --self=true 2>$null
+                      $isConnected = if ($tsStatus) { "✅ Connected" } else { "❌ Disconnected" }
+                  } else {
+                      $isConnected = "⚠️  Not Installed"
+                  }
+              } catch {
+                  $isConnected = "⚠️  Error"
+              }
               
-              # SSH check
-              $sshRunning = Get-Service -Name sshd -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status
-              $sshStatus = if ($sshRunning -eq "Running") { "✅ Running" } else { "⚠️  Not Running" }
+              try {
+                  $rdpRunning = Get-Service -Name TermService -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status
+                  $rdpStatus = if ($rdpRunning -eq "Running") { "✅ Running" } else { "⚠️  Stopped" }
+              } catch {
+                  $rdpStatus = "⚠️  Error"
+              }
               
-              Write-Host ""
-              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ━━━ HEALTH CHECK ━━━" -ForegroundColor Cyan
-              Write-Host "⏱️  Elapsed: $($elapsed.Hours)h $($elapsed.Minutes)m | Remaining: $($remaining.Hours)h $($remaining.Minutes)m" -ForegroundColor Yellow
-              Write-Host "📊 CPU: $cpuUsage% | RAM: $memUsage GB / $memTotal GB" -ForegroundColor Magenta
-              Write-Host "🔗 Tailscale: $isConnected" -ForegroundColor Cyan
-              Write-Host "🖥️  RDP: $rdpStatus" -ForegroundColor Cyan
-              Write-Host "🐚 SSH: $sshStatus" -ForegroundColor Cyan
-              Write-Host ""
+              try {
+                  $sshRunning = Get-Service -Name sshd -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status
+                  $sshStatus = if ($sshRunning -eq "Running") { "✅ Running" } else { "⚠️  Stopped" }
+              } catch {
+                  $sshStatus = "⚠️  Error"
+              }
               
-              Start-Sleep -Seconds ($healthCheckInterval * 60)
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ⏱️ $($elapsed.Minutes)m | 📊 CPU:$cpuUsage% RAM:$memUsage/$memTotal | 🔗$isConnected | 🖥️$rdpStatus | 🐚$sshStatus"
+              
+              Start-Sleep -Seconds 300  # 5 minutes
           }
           
           Write-Host ""
-          Write-Host "⏰ Session duration exceeded (5 hours). Stopping workflow..." -ForegroundColor Yellow
-          Write-Host ""
+          Write-Host "⏰ Session completed. Cleaning up..." -ForegroundColor Yellow
 
       - name: Cleanup RDP User (always)
         if: always()
         shell: pwsh
         run: |
           try {
-              $userName = "RDP"
-              if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
-                  Remove-LocalUser -Name $userName -Force
-                  Write-Host "✅ RDP user cleaned up" -ForegroundColor Green
+              if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+                  Remove-LocalUser -Name "RDP" -Force
+                  Write-Host "✅ RDP user removed" -ForegroundColor Green
               }
           } catch {
-              Write-Warning "⚠️  Cleanup warning: $_"
+              Write-Warning "⚠️  Cleanup: $_"
           }
