@@ -2,173 +2,510 @@ name: RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      python_version:
+        description: 'Python version to install'
+        required: false
+        default: '3.12'
+        type: choice
+        options:
+          - '3.9'
+          - '3.10'
+          - '3.11'
+          - '3.12'
+      additional_packages:
+        description: 'Additional pip packages (comma-separated, optional)'
+        required: false
+        default: ''
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
+    outputs:
+      session-info: ${{ steps.display-creds.outputs.info }}
 
     steps:
+      - name: Set Session Configuration
+        shell: pwsh
+        run: |
+          $sessionDuration = 300  # 5 hours
+          $maxGithubLimit = 360   # 6 hours max
+          $margin = $maxGithubLimit - $sessionDuration
+          
+          Add-Content -Path $env:GITHUB_ENV -Value "SESSION_DURATION=$sessionDuration"
+          Add-Content -Path $env:GITHUB_ENV -Value "MAX_GITHUB_LIMIT=$maxGithubLimit"
+          Add-Content -Path $env:GITHUB_ENV -Value "MARGIN=$margin"
+          
+          Write-Host "⏱️  Session Duration: $sessionDuration minutes (5h)" -ForegroundColor Cyan
+          Write-Host "⏱️  Max GitHub Actions limit: $maxGithubLimit minutes (6h)" -ForegroundColor Cyan
+          Write-Host "✅ Margin de sécurité: $margin minutes" -ForegroundColor Green
+
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-
-          # Keep Network Level Authentication ENABLED (Value = 1)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 1 -Force
-
-          # Set SecurityLayer to 2 (RDP Security Layer)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 2 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-
-          # Allow incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-          Start-Sleep -Seconds 5
+          try {
+              Write-Host "🔧 Configuring RDP Settings..." -ForegroundColor Cyan
+              
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                               -Name "fDenyTSConnections" -Value 0 -Force
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                               -Name "UserAuthentication" -Value 1 -Force
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                               -Name "SecurityLayer" -Value 2 -Force
+              
+              netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+              netsh advfirewall firewall add rule name="RDP-Tailscale" `
+                dir=in action=allow protocol=TCP localport=3389 >$null 2>&1
+              
+              netsh advfirewall firewall delete rule name="SSH-Server" 2>$null
+              netsh advfirewall firewall add rule name="SSH-Server" `
+                dir=in action=allow protocol=TCP localport=22 >$null 2>&1
+              
+              netsh advfirewall firewall delete rule name="VSCode-Server" 2>$null
+              netsh advfirewall firewall add rule name="VSCode-Server" `
+                dir=in action=allow protocol=TCP localport=8000 >$null 2>&1
+              
+              Restart-Service -Name TermService -Force
+              Start-Sleep -Seconds 5
+              Write-Host "✅ RDP configuration completed successfully" -ForegroundColor Green
+          } catch {
+              Write-Error "❌ RDP configuration failed: $_"
+              exit 1
+          }
 
       - name: Create RDP User with Secure Password
         shell: pwsh
         run: |
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
+          try {
+              Write-Host "🔑 Creating RDP User..." -ForegroundColor Cyan
+              
+              $charSet = @{
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = @('@', '#', '$', '%', '&', '*', '+', '-', '=', '!', '?')
+              }
 
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 4
+              $rawPassword += $charSet.Lower | Get-Random -Count 4
+              $rawPassword += $charSet.Number | Get-Random -Count 4
+              $rawPassword += $charSet.Special | Get-Random -Count 4
+              $password = -join ($rawPassword | Sort-Object { Get-Random })
 
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+              $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+              $userName = "RDP"
 
-          # Check if user already exists before creating
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Write-Host "User RDP already exists. Updating password..."
-              Set-LocalUser -Name "RDP" -Password $securePass
-          } else {
-              New-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires
-              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          }
-
-          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
-
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              Write-Error "User creation failed"
+              if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+                  Write-Host "⚠️  User RDP already exists. Updating password..." -ForegroundColor Yellow
+                  Set-LocalUser -Name $userName -Password $securePass
+              } else {
+                  New-LocalUser -Name $userName -Password $securePass -PasswordNeverExpires -ErrorAction Stop
+                  Add-LocalGroupMember -Group "Administrators" -Member $userName
+                  Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName
+              }
+              
+              Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
+              Write-Host "✅ RDP user created/updated successfully" -ForegroundColor Green
+          } catch {
+              Write-Error "❌ User creation failed: $_"
               exit 1
           }
 
-          Write-Host "RDP User created/updated successfully"
+      - name: Install Python
+        shell: pwsh
+        run: |
+          try {
+              $pythonVersion = "${{ github.event.inputs.python_version }}"
+              Write-Host "🐍 Installing Python $pythonVersion..." -ForegroundColor Cyan
+              
+              $pythonUrl = "https://www.python.org/ftp/python/"
+              
+              $versionMap = @{
+                  "3.9"  = "3.9.19"
+                  "3.10" = "3.10.14"
+                  "3.11" = "3.11.9"
+                  "3.12" = "3.12.3"
+              }
+              
+              $fullVersion = $versionMap[$pythonVersion]
+              $installerUrl = "${pythonUrl}${fullVersion}/python-${fullVersion}-amd64.exe"
+              $installerPath = "$env:TEMP\python-installer.exe"
+
+              Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -ErrorAction Stop
+              Start-Process $installerPath -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0" -Wait -NoNewWindow
+              Remove-Item $installerPath -Force
+
+              python --version
+              pip --version
+              Write-Host "✅ Python $pythonVersion installed successfully" -ForegroundColor Green
+          } catch {
+              Write-Error "❌ Python installation failed: $_"
+              exit 1
+          }
+
+      - name: Install Python Packages
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "📦 Installing Python packages..." -ForegroundColor Cyan
+              
+              $packages = @(
+                  "pip", "setuptools", "wheel", "virtualenv", "poetry",
+                  "requests", "numpy", "pandas", "matplotlib", "seaborn", "plotly",
+                  "jupyter", "jupyterlab", "ipython", "notebook",
+                  "flask", "django", "fastapi", "uvicorn",
+                  "sqlalchemy", "psycopg2-binary", "pymongo",
+                  "beautifulsoup4", "selenium", "scrapy",
+                  "opencv-python", "pillow",
+                  "scikit-learn", "tensorflow", "torch",
+                  "black", "flake8", "pylint", "mypy",
+                  "pytest", "pytest-cov",
+                  "python-dotenv", "pyyaml", "toml",
+                  "click", "typer", "rich"
+              )
+              
+              $additionalPackages = "${{ github.event.inputs.additional_packages }}"
+              if ($additionalPackages) {
+                  $additional = $additionalPackages -split "," | ForEach-Object { $_.Trim() }
+                  $packages += $additional
+              }
+
+              pip install --upgrade pip setuptools wheel
+              pip install $packages
+              
+              Write-Host "✅ All Python packages installed" -ForegroundColor Green
+          } catch {
+              Write-Error "❌ Package installation failed: $_"
+              exit 1
+          }
+
+      - name: Install Docker
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "🐳 Installing Docker..." -ForegroundColor Cyan
+              
+              $dockerUrl = "https://desktop.docker.com/win/stable/Docker%20Desktop%20Installer.exe"
+              $installerPath = "$env:TEMP\docker-installer.exe"
+
+              Invoke-WebRequest -Uri $dockerUrl -OutFile $installerPath -ErrorAction Stop
+              Start-Process $installerPath -ArgumentList "install --quiet --accept-license" -Wait -NoNewWindow
+              Remove-Item $installerPath -Force
+
+              Start-Sleep -Seconds 10
+              Write-Host "✅ Docker installed successfully" -ForegroundColor Green
+          } catch {
+              Write-Warning "⚠️  Docker installation skipped or failed (may require restart)"
+          }
+
+      - name: Install Node.js & npm
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "📦 Installing Node.js & npm..." -ForegroundColor Cyan
+              
+              $nodeUrl = "https://nodejs.org/dist/v20.11.0/node-v20.11.0-x64.msi"
+              $installerPath = "$env:TEMP\nodejs-installer.msi"
+
+              Invoke-WebRequest -Uri $nodeUrl -OutFile $installerPath -ErrorAction Stop
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet" -Wait -NoNewWindow
+              Remove-Item $installerPath -Force
+
+              node --version
+              npm --version
+              Write-Host "✅ Node.js & npm installed successfully" -ForegroundColor Green
+          } catch {
+              Write-Error "❌ Node.js installation failed: $_"
+              exit 1
+          }
+
+      - name: Install Additional Tools
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "🛠️  Installing additional tools..." -ForegroundColor Cyan
+              
+              # 7-Zip
+              $7zipUrl = "https://www.7-zip.org/a/7z2301-x64.exe"
+              $7zipInstaller = "$env:TEMP\7zip-installer.exe"
+              Invoke-WebRequest -Uri $7zipUrl -OutFile $7zipInstaller -ErrorAction Stop
+              Start-Process $7zipInstaller -ArgumentList "/S" -Wait -NoNewWindow
+              Remove-Item $7zipInstaller -Force
+
+              # Git
+              $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.43.0.windows.1/Git-2.43.0-64-bit.exe"
+              $gitInstaller = "$env:TEMP\git-installer.exe"
+              Invoke-WebRequest -Uri $gitUrl -OutFile $gitInstaller -ErrorAction Stop
+              Start-Process $gitInstaller -ArgumentList "/SILENT /NORESTART" -Wait -NoNewWindow
+              Remove-Item $gitInstaller -Force
+
+              Write-Host "✅ Additional tools installed" -ForegroundColor Green
+          } catch {
+              Write-Warning "⚠️  Some tools installation skipped"
+          }
+
+      - name: Install and Configure OpenSSH
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "🔐 Installing OpenSSH..." -ForegroundColor Cyan
+              
+              # Check if OpenSSH is already installed
+              $sshService = Get-Service -Name sshd -ErrorAction SilentlyContinue
+              if (-not $sshService) {
+                  Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+              }
+
+              # Start SSH service
+              Start-Service sshd -ErrorAction SilentlyContinue
+              Set-Service -Name sshd -StartupType Automatic
+
+              Write-Host "✅ OpenSSH configured successfully" -ForegroundColor Green
+          } catch {
+              Write-Warning "⚠️  OpenSSH setup skipped: $_"
+          }
+
+      - name: Install VS Code Server
+        shell: pwsh
+        run: |
+          try {
+              Write-Host "💻 Installing VS Code Server..." -ForegroundColor Cyan
+              
+              $releaseUrl = "https://api.github.com/repos/coder/code-server/releases/latest"
+              $releases = Invoke-RestMethod -Uri $releaseUrl
+              $downloadUrl = $releases.assets | Where-Object { $_.name -like "*windows*x86_64*setup*" } | Select-Object -First 1 -ExpandProperty browser_download_url
+              
+              if ($downloadUrl) {
+                  $installerPath = "$env:TEMP\code-server-installer.exe"
+                  Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -ErrorAction Stop
+                  Start-Process $installerPath -ArgumentList "/S" -Wait -NoNewWindow
+                  Remove-Item $installerPath -Force
+                  Write-Host "✅ VS Code Server installed" -ForegroundColor Green
+              } else {
+                  Write-Warning "⚠️  Could not find VS Code Server installer"
+              }
+          } catch {
+              Write-Warning "⚠️  VS Code Server installation failed: $_"
+          }
 
       - name: Install Tailscale
         shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-
           try {
-              Write-Host "Downloading Tailscale..."
-              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
-              Write-Host "Installing Tailscale..."
-              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Write-Host "🔗 Installing Tailscale..." -ForegroundColor Cyan
+              
+              $releaseUrl = "https://api.github.com/repos/tailscale/tailscale/releases/latest"
+              $releases = Invoke-RestMethod -Uri $releaseUrl
+              $downloadUrl = $releases.assets | Where-Object { $_.name -like "*windows-amd64*" -and $_.name -like "*.msi" } | Select-Object -First 1 -ExpandProperty browser_download_url
+              
+              if (-not $downloadUrl) {
+                  Write-Error "Could not find latest Tailscale MSI"
+                  exit 1
+              }
+              
+              $installerPath = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -ErrorAction Stop
+              
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
               Remove-Item $installerPath -Force
-              Write-Host "Tailscale installed successfully"
+              Write-Host "✅ Tailscale installed successfully" -ForegroundColor Green
           } catch {
-              Write-Error "Failed to install Tailscale: $_"
+              Write-Error "❌ Failed to install Tailscale: $_"
               exit 1
           }
 
       - name: Establish Tailscale Connection
         shell: pwsh
         run: |
-          $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          
-          if (-not (Test-Path $tailscalePath)) {
-              Write-Error "Tailscale executable not found at $tailscalePath"
+          try {
+              $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+              
+              if (-not (Test-Path $tailscalePath)) {
+                  Write-Error "Tailscale executable not found"
+                  exit 1
+              }
+
+              Write-Host "🔗 Connecting to Tailscale..." -ForegroundColor Cyan
+              & $tailscalePath up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+                --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-dns=false
+              
+              $tsIP = $null
+              $retries = 0
+              
+              while (-not $tsIP -and $retries -lt 20) {
+                  Start-Sleep -Seconds 3
+                  $tsIP = & $tailscalePath ip -4 2>$null
+                  $retries++
+                  if (-not $tsIP) {
+                      Write-Host "⏳ Waiting for Tailscale IP... (attempt $retries/20)" -ForegroundColor Yellow
+                  }
+              }
+              
+              if (-not $tsIP) {
+                  Write-Error "Tailscale IP not assigned after 20 retries"
+                  exit 1
+              }
+              
+              Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+              Write-Host "✅ Tailscale IP assigned: $tsIP" -ForegroundColor Green
+          } catch {
+              Write-Error "❌ Tailscale connection failed: $_"
               exit 1
           }
-
-          Write-Host "Connecting to Tailscale..."
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & $tailscalePath up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID"
-
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-
-          while (-not $tsIP -and $retries -lt 15) {
-              Start-Sleep -Seconds 3
-              $tsIP = & $tailscalePath ip -4
-              if ($tsIP) { break }
-              $retries++
-              Write-Host "Waiting for Tailscale IP... (attempt $retries/15)"
-          }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned after 15 retries. Exiting."
-              exit 1
-          }
-
-          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
-          Write-Host "Tailscale IP assigned: $tsIP"
 
       - name: Verify RDP Accessibility
         shell: pwsh
         run: |
-          $tsIP = $env:TAILSCALE_IP
-          Write-Host "Verifying RDP on Tailscale IP: $tsIP"
+          try {
+              $tsIP = $env:TAILSCALE_IP
+              
+              if (-not $tsIP) {
+                  Write-Error "TAILSCALE_IP not set"
+                  exit 1
+              }
 
-          if (-not $tsIP) {
-              Write-Error "TAILSCALE_IP environment variable not set"
+              Write-Host "🔍 Verifying RDP accessibility..." -ForegroundColor Cyan
+              $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
+              
+              if (-not $testResult.TcpTestSucceeded) {
+                  Write-Error "RDP port not accessible"
+                  exit 1
+              }
+              
+              Write-Host "✅ RDP verification successful" -ForegroundColor Green
+          } catch {
+              Write-Error "❌ Verification failed: $_"
               exit 1
           }
 
-          Start-Sleep -Seconds 2
+      - name: Environment Info
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "📋 Environment Information:" -ForegroundColor Cyan
+          Write-Host "================================" -ForegroundColor Cyan
+          
+          Write-Host "Python:" -ForegroundColor Yellow
+          python --version
+          Write-Host ""
+          
+          Write-Host "Node.js & npm:" -ForegroundColor Yellow
+          node --version
+          npm --version
+          Write-Host ""
+          
+          Write-Host "Git:" -ForegroundColor Yellow
+          git --version
+          Write-Host ""
+          
+          Write-Host "Pip packages:" -ForegroundColor Yellow
+          pip list --format=quiet | Select-Object -First 20
+          
+          Write-Host ""
+          Write-Host "✅ All tools verified" -ForegroundColor Green
 
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
-
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-
-          Write-Host "TCP connectivity successful!"
-
-      - name: Maintain Connection and Display Credentials
+      - name: Display Connection Details
+        id: display-creds
         shell: pwsh
         run: |
           $rdpPassword = $env:RDP_PASSWORD
           $tsIP = $env:TAILSCALE_IP
+          $sessionDuration = $env:SESSION_DURATION
+          $userName = "RDP"
 
           Write-Host ""
-          Write-Host "========================================" -ForegroundColor Green
-          Write-Host "=== RDP CONNECTION DETAILS ===" -ForegroundColor Green
-          Write-Host "========================================" -ForegroundColor Green
-          Write-Host "Server Address: $tsIP" -ForegroundColor Yellow
-          Write-Host "Port: 3389" -ForegroundColor Yellow
-          Write-Host "Username: RDP" -ForegroundColor Yellow
-          Write-Host "Password: $rdpPassword" -ForegroundColor Yellow
-          Write-Host "========================================" -ForegroundColor Green
+          Write-Host "╔════════════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║         🚀 RDP & SSH CONNECTION DETAILS 🚀             ║" -ForegroundColor Green
+          Write-Host "╠════════════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║ 📍 SERVER ADDRESS                                      ║" -ForegroundColor Green
+          Write-Host "║    $tsIP" -ForegroundColor Yellow
+          Write-Host "║                                                        ║" -ForegroundColor Green
+          Write-Host "║ 🔑 RDP ACCESS                                          ║" -ForegroundColor Green
+          Write-Host "║    Username: $userName" -ForegroundColor Yellow
+          Write-Host "║    Password: $rdpPassword" -ForegroundColor Yellow
+          Write-Host "║    Port: 3389                                          ║" -ForegroundColor Yellow
+          Write-Host "║                                                        ║" -ForegroundColor Green
+          Write-Host "║ 🐚 SSH COMMAND (COPY-PASTE)                            ║" -ForegroundColor Green
+          Write-Host "║                                                        ║" -ForegroundColor Green
+          Write-Host "║ ssh -o StrictHostKeyChecking=no RDP@$tsIP" -ForegroundColor Cyan
+          Write-Host "║                                                        ║" -ForegroundColor Green
+          Write-Host "║ 💻 VS CODE SERVER                                      ║" -ForegroundColor Green
+          Write-Host "║    http://$tsIP`:8000" -ForegroundColor Yellow
+          Write-Host "║                                                        ║" -ForegroundColor Green
+          Write-Host "║ 🐍 Python Version: 3.12                                ║" -ForegroundColor Green
+          Write-Host "║ 🐳 Docker: Installed                                   ║" -ForegroundColor Green
+          Write-Host "║ 📦 Node.js: Installed                                  ║" -ForegroundColor Green
+          Write-Host "║                                                        ║" -ForegroundColor Green
+          Write-Host "║ ⏱️  SESSION DURATION: $sessionDuration minutes (5h)      ║" -ForegroundColor Green
+          Write-Host "║ ⏱️  Max GitHub Actions limit: 360 minutes (6h)          ║" -ForegroundColor Green
+          Write-Host "║ ✅ Margin de sécurité: 60 minutes                      ║" -ForegroundColor Green
+          Write-Host "╚════════════════════════════════════════════════════════╝" -ForegroundColor Green
           Write-Host ""
 
-          # Keep runner active indefinitely (or until manually cancelled)
+      - name: Health Check & Monitoring
+        shell: pwsh
+        run: |
+          $sessionDuration = [int]$env:SESSION_DURATION
           $startTime = Get-Date
-          while ($true) {
+          $endTime = $startTime.AddMinutes($sessionDuration)
+          $healthCheckInterval = 5  # minutes
+
+          while ((Get-Date) -lt $endTime) {
+              $remaining = $endTime - (Get-Date)
               $elapsed = (Get-Date) - $startTime
-              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active - Elapsed: $($elapsed.Hours)h $($elapsed.Minutes)m - Workflow will stop in 60h or when manually cancelled"
-              Start-Sleep -Seconds 300
+              
+              # Get system resources
+              $cpuUsage = (Get-WmiObject -Query "SELECT LoadPercentage FROM Win32_Processor" | Select-Object -First 1).LoadPercentage
+              $memUsage = ([math]::Round((Get-WmiObject -Class Win32_OperatingSystem).TotalVisibleMemorySize - (Get-WmiObject -Class Win32_OperatingSystem).FreePhysicalMemory) / 1024 / 1024, 2)
+              $memTotal = ([math]::Round((Get-WmiObject -Class Win32_OperatingSystem).TotalVisibleMemorySize / 1024 / 1024, 2))
+              
+              # Tailscale health check
+              $tailscalePath = "$env:ProgramFiles\Tailscale\tailscale.exe"
+              $tsStatus = & $tailscalePath status --self=true 2>$null
+              $isConnected = if ($tsStatus) { "✅ Connected" } else { "❌ Disconnected" }
+              
+              if ($tsStatus -eq $null) {
+                  Write-Host "⚠️  Tailscale disconnected! Attempting reconnect..." -ForegroundColor Yellow
+                  & $tailscalePath up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-dns=false 2>$null
+                  Start-Sleep -Seconds 5
+              }
+              
+              # RDP check
+              $rdpRunning = Get-Service -Name TermService | Select-Object -ExpandProperty Status
+              $rdpStatus = if ($rdpRunning -eq "Running") { "✅ Running" } else { "⚠️  Not Running" }
+              
+              # SSH check
+              $sshRunning = Get-Service -Name sshd -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status
+              $sshStatus = if ($sshRunning -eq "Running") { "✅ Running" } else { "⚠️  Not Running" }
+              
+              Write-Host ""
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ━━━ HEALTH CHECK ━━━" -ForegroundColor Cyan
+              Write-Host "⏱️  Elapsed: $($elapsed.Hours)h $($elapsed.Minutes)m | Remaining: $($remaining.Hours)h $($remaining.Minutes)m" -ForegroundColor Yellow
+              Write-Host "📊 CPU: $cpuUsage% | RAM: $memUsage GB / $memTotal GB" -ForegroundColor Magenta
+              Write-Host "🔗 Tailscale: $isConnected" -ForegroundColor Cyan
+              Write-Host "🖥️  RDP: $rdpStatus" -ForegroundColor Cyan
+              Write-Host "🐚 SSH: $sshStatus" -ForegroundColor Cyan
+              Write-Host ""
+              
+              Start-Sleep -Seconds ($healthCheckInterval * 60)
+          }
+          
+          Write-Host ""
+          Write-Host "⏰ Session duration exceeded (5 hours). Stopping workflow..." -ForegroundColor Yellow
+          Write-Host ""
+
+      - name: Cleanup RDP User (always)
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+              $userName = "RDP"
+              if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+                  Remove-LocalUser -Name $userName -Force
+                  Write-Host "✅ RDP user cleaned up" -ForegroundColor Green
+              }
+          } catch {
+              Write-Warning "⚠️  Cleanup warning: $_"
           }
